@@ -1,0 +1,16 @@
+{
+  "client_executable_path": "",
+  "selected_sound": "gotime.mp3",
+  "play_custom_sound": true,
+  "notification_on_change": true,
+  "notification_when_down": false,
+  "auto_action_mode": "focus_existing",
+  "check_interval": 2,
+  "enhanced_graphics": true,
+  "window_geometry": [
+    244,
+    191,
+    984,
+    1005
+  ]
+}
