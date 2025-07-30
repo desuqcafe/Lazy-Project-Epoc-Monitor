@@ -13,7 +13,7 @@ import json
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                            QHBoxLayout, QLabel, QPushButton, QSpinBox, QCheckBox, 
                            QTextEdit, QGroupBox, QFileDialog, QMessageBox, QFrame,
-                           QGridLayout, QSizePolicy, QComboBox)
+                           QGridLayout, QSizePolicy, QComboBox, QSlider)
 from PyQt6.QtCore import QTimer, QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QFont, QPalette, QColor
 
@@ -55,6 +55,7 @@ class UserSettings:
             "client_executable_path": "",
             "selected_sound": "gotime.mp3",
             "play_custom_sound": False,
+            "sound_volume": 35,  # Default volume at 35%
             "notification_on_change": True,
             "notification_when_down": False,
             "auto_action_mode": "none",  # "none", "focus_existing", "launch_and_focus"
@@ -165,6 +166,7 @@ class ServerMonitor(QMainWindow):
         self.client_executable_path = settings["client_executable_path"]
         self.selected_sound = settings["selected_sound"]
         self.play_custom_sound = settings["play_custom_sound"]
+        self.sound_volume = settings["sound_volume"]  # New volume setting
         self.enhanced_graphics = settings["enhanced_graphics"]
         self.is_simulating = False
         
@@ -206,6 +208,10 @@ class ServerMonitor(QMainWindow):
         self.notify_down_cb.setChecked(self.notification_when_down)
         self.play_sound_cb.setChecked(self.play_custom_sound)
         
+        # Set volume slider
+        self.volume_slider.setValue(self.sound_volume)
+        self.volume_label.setText(f"{self.sound_volume}%")
+        
         # Set sound dropdown
         if self.selected_sound in self.available_sounds:
             self.sound_combo.setCurrentText(self.selected_sound)
@@ -234,6 +240,7 @@ class ServerMonitor(QMainWindow):
             "client_executable_path": self.client_executable_path,
             "selected_sound": self.selected_sound,
             "play_custom_sound": self.play_custom_sound,
+            "sound_volume": self.sound_volume,
             "notification_on_change": self.notification_on_change,
             "notification_when_down": self.notification_when_down,
             "auto_action_mode": self.auto_action_mode,
@@ -310,7 +317,7 @@ class ServerMonitor(QMainWindow):
         
     def init_ui(self):
         self.setWindowTitle("Project Epoch Server Monitor")
-        self.setGeometry(100, 100, 600, 750)  # More compact size
+        self.setGeometry(100, 100, 600, 780)  # Slightly taller for volume slider
         
         # Set dark theme with more compact styling
         self.setStyleSheet("""
@@ -421,6 +428,27 @@ class ServerMonitor(QMainWindow):
                 border: 1px solid #0078d4;
                 border-radius: 2px;
             }
+            QSlider::groove:horizontal {
+                border: 1px solid #555555;
+                height: 6px;
+                background-color: #404040;
+                margin: 2px 0;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background-color: #0078d4;
+                border: 1px solid #0078d4;
+                width: 16px;
+                margin: -6px 0;
+                border-radius: 8px;
+            }
+            QSlider::handle:horizontal:hover {
+                background-color: #1e88e5;
+            }
+            QSlider::sub-page:horizontal {
+                background-color: #0078d4;
+                border-radius: 3px;
+            }
             QTextEdit {
                 background-color: #1e1e1e;
                 border: 1px solid #555555;
@@ -530,7 +558,7 @@ class ServerMonitor(QMainWindow):
         controls_layout.addLayout(client_row)
         
         # Client path label
-        self.client_path_label = QLabel("Click 'Browse' to select game executable")
+        self.client_path_label = QLabel("Click 'Browse' and find Project Epoch Launcher")
         self.client_path_label.setStyleSheet("color: #999999; font-style: italic; font-size: 11px;")
         controls_layout.addWidget(self.client_path_label)
         
@@ -594,6 +622,26 @@ class ServerMonitor(QMainWindow):
         sound_row.addStretch()
         settings_layout.addLayout(sound_row)
         
+        # Volume control row
+        volume_row = QHBoxLayout()
+        volume_row.addWidget(QLabel("Volume:"))
+        
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setMinimum(0)
+        self.volume_slider.setMaximum(100)
+        self.volume_slider.setValue(35)  # Default 35%
+        self.volume_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.volume_slider.setTickInterval(25)
+        self.volume_slider.valueChanged.connect(self.on_volume_changed)
+        
+        self.volume_label = QLabel("35%")
+        self.volume_label.setMinimumWidth(35)
+        self.volume_label.setStyleSheet("color: #64b5f6; font-weight: bold;")
+        
+        volume_row.addWidget(self.volume_slider)
+        volume_row.addWidget(self.volume_label)
+        settings_layout.addLayout(volume_row)
+        
         self.play_sound_cb = QCheckBox("Play sound with notifications")
         self.play_sound_cb.toggled.connect(self.toggle_sound_notifications)
         settings_layout.addWidget(self.play_sound_cb)
@@ -609,6 +657,7 @@ class ServerMonitor(QMainWindow):
                 self.sound_combo.setEnabled(False)
                 self.test_sound_btn.setEnabled(False)
                 self.play_sound_cb.setEnabled(False)
+                self.volume_slider.setEnabled(False)
         else:
             # Show audio folder info and library used
             if len(self.available_sounds) > 1:
@@ -669,6 +718,25 @@ class ServerMonitor(QMainWindow):
         # Timer for UI updates
         self.ui_timer = QTimer()
         self.ui_timer.timeout.connect(self.update_runtime_display)
+    
+    def on_volume_changed(self, value):
+        """Handle volume slider change"""
+        self.sound_volume = value
+        self.volume_label.setText(f"{value}%")
+        # Save setting immediately
+        self.user_settings.set("sound_volume", value)
+        
+        # Update color based on volume level
+        if value == 0:
+            color = "#757575"  # Gray for muted
+        elif value <= 30:
+            color = "#ff9800"  # Orange for low
+        elif value <= 70:
+            color = "#64b5f6"  # Blue for medium
+        else:
+            color = "#66bb6a"  # Green for high
+        
+        self.volume_label.setStyleSheet(f"color: {color}; font-weight: bold;")
     
     def create_graph_section(self, layout):
         """Create graph section with optional enhanced effects"""
@@ -902,12 +970,15 @@ class ServerMonitor(QMainWindow):
         self.user_settings.set("selected_sound", sound_name)
     
     def play_system_sound(self):
-        """Play system notification sound"""
+        """Play system notification sound with volume adjustment"""
         try:
             if sys.platform == "win32":
                 import winsound
-                winsound.MessageBeep(winsound.MB_ICONASTERISK)  # Fixed constant
+                # Note: Windows system sounds don't support volume control
+                # The volume is controlled by system notification volume
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
             elif sys.platform == "darwin":  # macOS
+                # macOS system sounds also use system volume
                 os.system("afplay /System/Library/Sounds/Glass.aiff")
             else:  # Linux
                 os.system("paplay /usr/share/sounds/alsa/Front_Left.wav 2>/dev/null || echo -e '\a'")
@@ -915,24 +986,49 @@ class ServerMonitor(QMainWindow):
             print(f"System sound error: {e}")
     
     def play_custom_sound_file(self, sound_path):
-        """Play custom sound file using available audio library"""
-        if AUDIO_LIB == "playsound3":
-            playsound(sound_path)
-        elif AUDIO_LIB == "pygame":
-            if not pygame.mixer.get_init():
-                pygame.mixer.init()
-            pygame.mixer.music.load(sound_path)
-            pygame.mixer.music.play()
+        """Play custom sound file using available audio library with volume control"""
+        try:
+            # Calculate volume factor (0.0 to 1.0)
+            volume_factor = self.sound_volume / 100.0
+            
+            if AUDIO_LIB == "playsound3":
+                # playsound3 doesn't support volume control directly
+                # We'll need to use pygame for volume-controlled playback
+                if volume_factor < 1.0:
+                    # Fall back to pygame if available for volume control
+                    try:
+                        import pygame
+                        if not pygame.mixer.get_init():
+                            pygame.mixer.init()
+                        pygame.mixer.music.set_volume(volume_factor)
+                        pygame.mixer.music.load(sound_path)
+                        pygame.mixer.music.play()
+                        return
+                    except ImportError:
+                        pass
+                
+                # If no volume control needed or pygame not available, use playsound3
+                playsound(sound_path)
+                
+            elif AUDIO_LIB == "pygame":
+                if not pygame.mixer.get_init():
+                    pygame.mixer.init()
+                pygame.mixer.music.set_volume(volume_factor)
+                pygame.mixer.music.load(sound_path)
+                pygame.mixer.music.play()
+                
+        except Exception as e:
+            print(f"Custom sound playback error: {e}")
     
     def play_sound(self):
-        """Play notification sound"""
+        """Play notification sound with volume control"""
         if not self.play_custom_sound:
             return
             
         sound_path = self.get_sound_path(self.selected_sound)
         
         if sound_path and os.path.exists(sound_path) and HAS_AUDIO:
-            # Play custom sound
+            # Play custom sound with volume
             try:
                 threading.Thread(target=lambda: self.play_custom_sound_file(sound_path), daemon=True).start()
             except Exception as e:
@@ -943,7 +1039,7 @@ class ServerMonitor(QMainWindow):
             self.play_system_sound()
     
     def test_sound(self):
-        """Test playing the selected sound"""
+        """Test playing the selected sound with current volume"""
         sound_path = self.get_sound_path(self.selected_sound)
         
         if sound_path and os.path.exists(sound_path):
@@ -953,14 +1049,14 @@ class ServerMonitor(QMainWindow):
                 
             try:
                 threading.Thread(target=lambda: self.play_custom_sound_file(sound_path), daemon=True).start()
-                self.add_to_log(f"Playing: {self.selected_sound} (using {AUDIO_LIB})")
+                self.add_to_log(f"Playing: {self.selected_sound} at {self.sound_volume}% volume (using {AUDIO_LIB})")
             except Exception as e:
                 self.add_to_log(f"Error playing {self.selected_sound}: {e}")
         else:
             # Test system sound
             try:
                 self.play_system_sound()
-                self.add_to_log("Playing system notification sound")
+                self.add_to_log(f"Playing system notification sound (volume controlled by system)")
             except Exception as e:
                 self.add_to_log(f"Error playing system sound: {e}")
     
