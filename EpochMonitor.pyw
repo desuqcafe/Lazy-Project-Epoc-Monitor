@@ -9,6 +9,8 @@ import subprocess
 import ctypes
 from ctypes import wintypes
 import json
+import requests
+import hashlib
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                            QHBoxLayout, QLabel, QPushButton, QSpinBox, QCheckBox, 
@@ -49,15 +51,58 @@ class UserSettings:
             "monitor_auth": True,
             "monitor_kezan": True,
             "monitor_gurubashi": True,
+            "monitor_manifest": True,
+            "manifest_check_interval": 30,
             "sound_notifications_enabled": True,
-            "settings_location": "auto",  # auto, portable, appdata, custom
+            "settings_location": "auto",
             "custom_settings_path": "",
             "auto_save_settings": True,
-            "keep_settings_cache": True
+            "keep_settings_cache": True,
+            "last_known_build_version": None,
+            "build_version_history": [],
+            "notify_on_build_update": True,
+            "manifest_client_directory": ""
         }
         self.settings = self.defaults.copy()
         self.current_settings_path = None
         self._initialize_settings_location()
+
+    def update_build_version(self, new_version):
+        """Update the build version and track history"""
+        old_version = self.settings.get("last_known_build_version")
+        
+        if old_version and old_version != new_version:
+            history = self.settings.get("build_version_history", [])
+            from datetime import datetime
+            history.append({
+                "from_version": old_version,
+                "to_version": new_version,
+                "timestamp": datetime.now().isoformat()
+            })
+            
+            # Keep only last 10 version changes
+            if len(history) > 10:
+                history = history[-10:]
+            
+            self.settings["build_version_history"] = history
+            
+        self.settings["last_known_build_version"] = new_version
+        
+        if self.settings.get("auto_save_settings", True):
+            self.save()
+            
+        return old_version
+
+    def get_version_change_info(self):
+        """Get information about recent version changes"""
+        history = self.settings.get("build_version_history", [])
+        current = self.settings.get("last_known_build_version")
+        
+        return {
+            "current_version": current,
+            "history": history,
+            "has_history": len(history) > 0
+        }
 
     def _initialize_settings_location(self):
         """Initialize settings location based on user preference"""
@@ -829,14 +874,13 @@ class ServerMonitor(QMainWindow):
         self.servers = {
             "Auth": {"host": "game.project-epoch.net", "port": 3724, "type": "Login"},
             "Kezan": {"host": "game.project-epoch.net", "port": 8085, "type": "PvE Realm"},
-            "Gurubashi": {"host": "game.project-epoch.net", "port": 8086, "type": "PvP Realm"}
+            "Gurubashi": {"host": "game.project-epoch.net", "port": 8086, "type": "PvP Realm"},
+            "Game Client": {"host": "updater.project-epoch.net", "port": 443, "type": "Manifest"}  # NEW
         }
         
-        # Initialize settings
         self.user_settings = UserSettings()
         settings = self.user_settings.load()
         
-        # Apply loaded settings
         self.sound_notifications_enabled = settings.get("sound_notifications_enabled", True)
         self.auto_action_mode = settings["auto_action_mode"]
         self.client_executable_path = settings["client_executable_path"]
@@ -844,24 +888,25 @@ class ServerMonitor(QMainWindow):
         self.sound_volume = settings["sound_volume"]
         self.is_simulating = False
         
-        # Audio resources path
+        self.manifest_check_interval = settings.get("manifest_check_interval", 30)
+        self.notify_on_build_update = settings.get("notify_on_build_update", True)
+        
         self.audio_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources", "audio")
         self.available_sounds = self.scan_audio_files()
         
-        # Validate selected sound still exists
         if self.selected_sound not in self.available_sounds:
             self.selected_sound = "gotime.mp3" if "gotime.mp3" in self.available_sounds else "System Default"
         
-        # Monitoring threads and server cards
         self.monitor_threads = {}
         self.server_cards = {}
+        self.manifest_thread = None
         self.start_time = None
         self.max_log_lines = 25
         
         self.threads_to_cleanup = []
         self.cleanup_timer = QTimer()
         self.cleanup_timer.timeout.connect(self._cleanup_finished_threads)
-        self.cleanup_timer.start(1000)  # Check every second for finished threads
+        self.cleanup_timer.start(1000)
         
         self.init_ui()
         self.load_ui_settings()
@@ -872,34 +917,40 @@ class ServerMonitor(QMainWindow):
             return
         
         cleaned_up = []
-        for thread in self.threads_to_cleanup[:]:  # Create copy to avoid modification during iteration
+        for thread in self.threads_to_cleanup[:]:
             try:
                 if thread.isFinished():
                     cleaned_up.append(thread)
                     thread.deleteLater()
                 elif not thread.running:
-                    # Thread was signaled to stop but hasn't finished yet
-                    # Check if it's been too long (stuck thread)
                     if not hasattr(thread, '_stop_time'):
                         thread._stop_time = time.time()
-                    elif time.time() - thread._stop_time > 10:  # 10 second timeout
-                        self.add_to_log(f"Force terminating stuck thread for {getattr(thread, 'server_name', 'unknown')}")
+                    elif time.time() - thread._stop_time > 5:
                         thread.terminate()
                         cleaned_up.append(thread)
-            except Exception as e:
-                # If we can't check the thread state, assume it's dead
+                elif hasattr(self, '_shutting_down') and self._shutting_down:
+                    if not hasattr(thread, '_stop_time'):
+                        thread._stop_time = time.time()
+                    elif time.time() - thread._stop_time > 2:
+                        thread.terminate()
+                        cleaned_up.append(thread)
+            except Exception:
                 cleaned_up.append(thread)
         
         for thread in cleaned_up:
             if thread in self.threads_to_cleanup:
                 self.threads_to_cleanup.remove(thread)
-    
+
+
     def load_ui_settings(self):
+        """Load UI settings from user settings including client directory restoration"""
         settings = self.user_settings.settings
         
+        # Load check interval
         interval = max(2, min(300, settings.get("check_interval", 5)))
         self.delay_spinbox.setValue(interval)
         
+        # Load sound settings
         self.sound_notifications_cb.setChecked(self.sound_notifications_enabled)
         
         volume = max(0, min(100, settings.get("sound_volume", 35)))
@@ -910,18 +961,72 @@ class ServerMonitor(QMainWindow):
         if self.selected_sound in self.available_sounds:
             self.sound_combo.setCurrentText(self.selected_sound)
         
+        # Update auto-action checkboxes
         self.update_auto_action_checkboxes()
         
-        
+        # Load executable path and update UI
         if self.client_executable_path and os.path.exists(self.client_executable_path):
             filename = os.path.basename(self.client_executable_path)
             self.client_path_label.setText(f"Client: {filename}")
             self.client_path_label.setStyleSheet("color: #66bb6a; font-weight: bold; font-size: 11px;")
         
+        # Load server monitoring checkboxes
         self.server_cards["Auth"].enabled_cb.setChecked(settings.get("monitor_auth", True))
         self.server_cards["Kezan"].enabled_cb.setChecked(settings.get("monitor_kezan", True))
         self.server_cards["Gurubashi"].enabled_cb.setChecked(settings.get("monitor_gurubashi", True))
+        self.server_cards["Game Client"].enabled_cb.setChecked(settings.get("monitor_manifest", True))
         
+        # Load manifest settings
+        self.manifest_check_interval = settings.get("manifest_check_interval", 30)
+        self.notify_on_build_update = settings.get("notify_on_build_update", True)
+        
+        # Load current version for manifest card
+        current_version = settings.get("last_known_build_version")
+        if current_version:
+            manifest_card = self.server_cards["Game Client"]
+            manifest_card.current_version = current_version
+            manifest_card.version_label.setText(f"Version: {current_version}")
+        
+        # Load manually saved client directory first
+        saved_client_dir = settings.get("manifest_client_directory", "")
+        client_dir_restored = False
+        
+        if saved_client_dir and os.path.exists(saved_client_dir):
+            if "Game Client" in self.server_cards:
+                manifest_card = self.server_cards["Game Client"]
+                # Mark restored directory as manual since user saved it
+                if manifest_card.set_client_directory_path(saved_client_dir, is_manual=True):
+                    dir_name = os.path.basename(saved_client_dir)
+                    # self.add_to_log(f"📁 Restored saved client directory: {dir_name}")
+                    client_dir_restored = True
+                else:
+                    # Directory exists but is invalid - clear the setting
+                    self.user_settings.set("manifest_client_directory", "")
+                    self.add_to_log("⚠️ Saved client directory is invalid, cleared from settings")
+        elif saved_client_dir:
+            # Directory was saved but no longer exists
+            self.user_settings.set("manifest_client_directory", "")
+            self.add_to_log("⚠️ Saved client directory no longer exists, cleared from settings")
+        
+        # FALLBACK: Auto-detection from executable path (only if no manual directory was restored)
+        if not client_dir_restored and self.client_executable_path and os.path.exists(self.client_executable_path):
+            if "Game Client" in self.server_cards:
+                manifest_card = self.server_cards["Game Client"]
+                
+                # Only try auto-detection if no client directory is currently set
+                if not manifest_card.client_directory:
+                    # This will be marked as auto-detected (is_manual=False)
+                    auto_detected = manifest_card.set_client_directory(self.client_executable_path)
+                    if auto_detected:
+                        self.add_to_log(f"🔍 Auto-detected client directory from executable path")
+                    else:
+                        self.add_to_log(f"💡 Could not auto-detect client directory - use '📁 Set Client Dir' button if needed")
+                else:
+                    # This shouldn't happen since we handle manual directory above, but just in case
+                    manual_dir = os.path.basename(manifest_card.client_directory)
+                    self.add_to_log(f"📂 Client directory already set: {manual_dir}")
+        
+        # Restore window geometry
         self._restore_window_geometry(settings.get("window_geometry"))
 
     def _restore_window_geometry(self, geometry):
@@ -955,6 +1060,10 @@ class ServerMonitor(QMainWindow):
             
         except (ValueError, TypeError, AttributeError) as e:
             self.add_to_log(f"Error restoring window geometry: {e}")
+
+    def clear_log_only(self):
+        """Clear activity log without affecting stats or settings"""
+        self.log_text.setPlainText("Activity log cleared...")
         
     def save_current_settings(self):
         current_settings = {
@@ -967,14 +1076,23 @@ class ServerMonitor(QMainWindow):
             "window_geometry": [self.x(), self.y(), self.width(), self.height()],
             "monitor_auth": self.server_cards["Auth"].enabled_cb.isChecked(),
             "monitor_kezan": self.server_cards["Kezan"].enabled_cb.isChecked(),
-            "monitor_gurubashi": self.server_cards["Gurubashi"].enabled_cb.isChecked()
+            "monitor_gurubashi": self.server_cards["Gurubashi"].enabled_cb.isChecked(),
+            "monitor_manifest": self.server_cards["Game Client"].enabled_cb.isChecked(),
+            "manifest_check_interval": self.manifest_check_interval,
+            "notify_on_build_update": self.notify_on_build_update,
+            "manifest_client_directory": getattr(self.server_cards["Game Client"], 'client_directory', "") or ""
         }
-        self.user_settings.update_multiple(current_settings)
         self.user_settings.update_multiple(current_settings)
     
     def closeEvent(self, event):
+        """Non-blocking close event handler"""
         self.save_current_settings()
+        self._shutting_down = True
+        
         self.stop_all_monitoring()
+        
+        QApplication.processEvents()
+        
         event.accept()
 
     def scan_audio_files(self):
@@ -1171,13 +1289,17 @@ class ServerMonitor(QMainWindow):
         row = 0
         col = 0
         for server_name, config in self.servers.items():
-            card = ServerCard(server_name, config["type"], config["port"])
+            if server_name == "Game Client":
+                card = ManifestServerCard()
+            else:
+                card = ServerCard(server_name, config["type"], config["port"])
+            
             card.monitoring_toggled.connect(self.on_server_monitoring_toggled)
             self.server_cards[server_name] = card
             cards_layout.addWidget(card, row, col)
             
             col += 1
-            if col > 2:
+            if col > 1:
                 col = 0
                 row += 1
         
@@ -1204,6 +1326,27 @@ class ServerMonitor(QMainWindow):
         clear_stats_btn = QPushButton("Clear All Stats")
         clear_stats_btn.clicked.connect(self.clear_all_stats)
         monitor_row.addWidget(clear_stats_btn)
+
+        clear_log_btn = QPushButton("Clear Log")
+        clear_log_btn.clicked.connect(self.clear_log_only)
+        clear_log_btn.setToolTip("Clear activity log only")
+        clear_log_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #404040;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                padding: 6px 8px;
+                color: #ffffff;
+                font-weight: bold;
+                min-height: 20px;
+                max-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #505050;
+                border-color: #666666;
+            }
+        """)
+        monitor_row.addWidget(clear_log_btn)
         
         detect_btn = QPushButton("Detect Active IPs")
         detect_btn.clicked.connect(self.test_connection_detection)
@@ -1330,6 +1473,9 @@ class ServerMonitor(QMainWindow):
         # Timer for UI updates
         self.ui_timer = QTimer()
         self.ui_timer.timeout.connect(self.update_runtime_display)
+        self.verbose_logging = False
+        self.last_status_log = {}
+
 
     def open_advanced_settings(self):
         """Open the advanced settings dialog"""
@@ -1386,7 +1532,7 @@ class ServerMonitor(QMainWindow):
             self.server_cards[server_name].set_to_disabled_state()
             
             if server_name in self.monitor_threads and self.monitor_threads[server_name].running:
-                self.stop_single_server_monitoring_async(server_name)
+                self.stop_single_server_monitoring(server_name)
                 self.add_to_log(f"Stopping monitoring for {server_name}...")
 
     def start_single_server_monitoring(self, server_name):
@@ -1421,7 +1567,8 @@ class ServerMonitor(QMainWindow):
             self.add_to_log(f"Error starting monitoring for {server_name}: {e}")
             return False
         
-    def stop_single_server_monitoring_async(self, server_name):
+    def stop_single_server_monitoring(self, server_name):
+        """Updated to be consistently non-blocking"""
         if server_name not in self.monitor_threads:
             return False
         
@@ -1430,32 +1577,8 @@ class ServerMonitor(QMainWindow):
             if thread.running:
                 thread.stop()
                 self.threads_to_cleanup.append(thread)
-                self.add_to_log(f"Signaled {server_name} monitoring to stop")
             
             # Remove from active threads immediately
-            del self.monitor_threads[server_name]
-            return True
-            
-        except Exception as e:
-            self.add_to_log(f"Error stopping monitoring for {server_name}: {e}")
-            return False
-
-    def stop_single_server_monitoring(self, server_name):
-        if server_name not in self.monitor_threads:
-            return False
-        
-        try:
-            thread = self.monitor_threads[server_name]
-            if thread.running:
-                thread.stop()
-                # Only use blocking wait during shutdown
-                if hasattr(self, '_shutting_down') and self._shutting_down:
-                    thread.wait(2000)  # Max 2 second wait during shutdown
-                else:
-                    # During normal operation, use async cleanup
-                    self.threads_to_cleanup.append(thread)
-            
-            # Remove from active threads
             if server_name in self.monitor_threads:
                 del self.monitor_threads[server_name]
             return True
@@ -1471,12 +1594,20 @@ class ServerMonitor(QMainWindow):
         self.detect_active_server_connections()
         
         enabled_servers = []
+        
         for server_name, card in self.server_cards.items():
+            if server_name == "Game Client":
+                continue
+                
             if card.enabled_cb.isChecked():
-                # Show starting state immediately
-                card.set_to_starting_state()  # NEW!
+                card.set_to_starting_state()
                 enabled_servers.append(server_name)
                 self.start_single_server_monitoring(server_name)
+        
+        if self.server_cards["Game Client"].enabled_cb.isChecked():
+            self.server_cards["Game Client"].set_to_starting_state()
+            if self.start_manifest_monitoring():
+                enabled_servers.append("Game Client")
         
         if enabled_servers:
             self.start_btn.setEnabled(False)
@@ -1484,18 +1615,20 @@ class ServerMonitor(QMainWindow):
             self.ui_timer.start(1000)
             
             servers_list = ", ".join(enabled_servers)
-            self.add_to_log(f"Starting monitoring: {servers_list}...")
+            self.add_to_log(f"Started monitoring: {servers_list}")
+            
+            # Clear previous status tracking to start fresh
+            self.last_status_log.clear()
         else:
             self.add_to_log("No servers enabled for monitoring!")
 
     def test_connection_detection(self):
-        self.add_to_log("Auto-detecting server connections...")
         detected = self.detect_active_server_connections()
         if detected:
-            for server, ip in detected.items():
-                self.add_to_log(f"✓ Detected {server} active on {ip}")
+            detected_list = [f"{server}({ip})" for server, ip in detected.items()]
+            self.add_to_log(f"Active connections: {', '.join(detected_list)}")
         else:
-            self.add_to_log("No active realm connections found")
+            self.add_to_log("No active realm connections detected")
         return detected
     
     def _is_valid_ip(self, ip):
@@ -1612,10 +1745,14 @@ class ServerMonitor(QMainWindow):
             self.add_to_log("Stopped all monitoring - servers reset to STOPPED")
     
     def clear_all_stats(self):
+        """Clear statistics but preserve important settings like client directory"""
         for card in self.server_cards.values():
             card.reset_stats()
         
-        self.add_to_log("Cleared all server statistics")
+        # Clear status tracking when stats are cleared
+        self.last_status_log.clear()
+        
+        self.add_to_log("Statistics cleared")
     
 
     def should_send_notification(self, server_name, is_up, status_changed):
@@ -1634,11 +1771,24 @@ class ServerMonitor(QMainWindow):
         if not self.server_cards[server_name].enabled_cb.isChecked():
             return False
         
-        # Only notify if Auth is online (makes sense - can't play without auth)
+        # Only notify if Auth is online
         if not self.is_auth_server_online():
             return False
                 
         return True
+    
+    def play_system_sound_only(self):
+        """Play system notification sound only (for server down/update events)"""
+        try:
+            if sys.platform == "win32":
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            elif sys.platform == "darwin":
+                os.system("afplay /System/Library/Sounds/Glass.aiff")
+            else:
+                os.system("paplay /usr/share/sounds/alsa/Front_Left.wav 2>/dev/null || echo -e '\a'")
+        except Exception as e:
+            print(f"System sound error: {e}")
     
     def detect_actual_playability(self):
         """
@@ -1682,45 +1832,104 @@ class ServerMonitor(QMainWindow):
         if "Auth" in self.server_cards:
             return self.server_cards["Auth"].is_up
         return False
-    
+        
     def on_status_update(self, server_name, is_up, check_duration):
+        if server_name not in self.monitor_threads:
+            return
+            
+        thread = self.monitor_threads[server_name]
+        if not thread.running:
+            return
+        
         if server_name in self.server_cards:
             old_status = self.server_cards[server_name].is_up
             self.server_cards[server_name].update_status(is_up, check_duration)
             
             status_changed = old_status != is_up
             
+            should_log = False
+            log_entry = ""
+            
             current_time = datetime.now().strftime("%H:%M:%S")
             status_text = "ONLINE" if is_up else ("TIMEOUT" if check_duration > 1.8 else "OFFLINE")
             
-            quality_indicator = ""
-            if is_up:
-                if check_duration < 0.5:
-                    quality_indicator = " 🟢"  # Fast connection
-                elif check_duration < 1.0:
-                    quality_indicator = " 🟡"  # Moderate connection  
-                elif check_duration < 2.0:
-                    quality_indicator = " 🟠"  # Slow connection (might be having issues)
-                else:
-                    quality_indicator = " 🔴"  # Very slow (likely rejecting connections)
-            else:
-                if server_name in ["Kezan", "Gurubashi"] and check_duration < 1.0:
-                    status_text = "REJECTING"
-                    quality_indicator = " 🚫"
+            # Determine if this status is worth logging
+            last_logged_status = self.last_status_log.get(server_name)
             
-            log_entry = f"[{current_time}] {server_name}: {status_text}{quality_indicator}"
             if status_changed:
-                log_entry += " ⚡"
+                # Always log status changes
+                should_log = True
+                quality_indicator = ""
+                
+                if is_up:
+                    if check_duration < 0.5:
+                        quality_indicator = " 🟢"  # Fast connection
+                    elif check_duration < 1.0:
+                        quality_indicator = " 🟡"  # Moderate connection  
+                    elif check_duration < 2.0:
+                        quality_indicator = " 🟠"  # Slow connection (might be having issues)
+                    else:
+                        quality_indicator = " 🔴"  # Very slow (likely rejecting connections)
+                else:
+                    if server_name in ["Kezan", "Gurubashi"] and check_duration < 1.0:
+                        status_text = "REJECTING"
+                        quality_indicator = " 🚫"
+                
+                log_entry = f"[{current_time}] {server_name}: {status_text}{quality_indicator} ⚡"
+                
+            elif server_name == "Game Client" and is_up:
+                # Special handling for Game Client - only log meaningful updates
+                if hasattr(self.server_cards[server_name], 'last_comparison') and self.server_cards[server_name].last_comparison:
+                    comparison = self.server_cards[server_name].last_comparison
+                    status = comparison["status"]
+                    version = comparison.get('version', 'unknown')
+                    
+                    # Only log if comparison status changed
+                    current_comparison_status = f"{status}_{version}"
+                    if last_logged_status != current_comparison_status:
+                        should_log = True
+                        if status == "up_to_date":
+                            log_entry = f"[{current_time}] Game Client: ✅ Up to date with {version}"
+                        elif status == "outdated":
+                            log_entry = f"[{current_time}] Game Client: 🆙 Update available to {version}"
+                        elif status == "incomplete":
+                            log_entry = f"[{current_time}] Game Client: ❌ Missing files for {version}"
+                        else:
+                            log_entry = f"[{current_time}] Game Client: ❓ Status unknown for {version}"
+                        
+                        self.last_status_log[server_name] = current_comparison_status
             
-            self.add_to_log(log_entry)
+            elif not is_up and server_name in ["Auth", "Kezan", "Gurubashi"]:
+                # For server offline events, only log once per offline period
+                if last_logged_status != "offline":
+                    should_log = True
+                    if status_text == "REJECTING":
+                        log_entry = f"[{current_time}] {server_name}: 🚫 Rejecting connections"
+                    elif status_text == "TIMEOUT":
+                        log_entry = f"[{current_time}] {server_name}: ⏱️ Connection timeout"
+                    else:
+                        log_entry = f"[{current_time}] {server_name}: ❌ Offline"
+                    
+                    self.last_status_log[server_name] = "offline"
+            
+            if should_log and log_entry:
+                self.add_to_log(log_entry)
+                if status_changed:
+                    self.last_status_log[server_name] = "online" if is_up else "offline"
+            
+            if status_changed and is_up and check_duration > 2.0 and server_name in ["Kezan", "Gurubashi"]:
+                self.add_to_log(f"⚠️ {server_name} online but very slow response - likely rejecting connections")
+            elif status_changed and not is_up and status_text == "REJECTING" and server_name in ["Kezan", "Gurubashi"]:
+                self.add_to_log(f"🚫 {server_name} appears to be rejecting game connections")
             
             if self.should_send_notification(server_name, is_up, status_changed):
-                if is_up and check_duration > 2.0:
-                    self.add_to_log(f"⚠️ {server_name} online but very slow response - likely rejecting connections")
-                elif not is_up and status_text == "REJECTING":
-                    self.add_to_log(f"🚫 {server_name} appears to be rejecting game connections")
-                
-                threading.Thread(target=self.play_sound, daemon=True).start()
+                # Play different sounds based on status
+                if is_up:
+                    # Server UP: Play user's chosen sound
+                    threading.Thread(target=self.play_sound, daemon=True).start()
+                else:
+                    # Server DOWN: Play Windows default sound
+                    threading.Thread(target=self.play_system_sound_only, daemon=True).start()
                 
                 status_word = "UP" if is_up else "DOWN"
                 auth_status = "Auth online" if self.is_auth_server_online() else "Auth offline"
@@ -1735,6 +1944,7 @@ class ServerMonitor(QMainWindow):
                 self.add_to_log(f"🔔 Alert: {server_name} is {status_word} ({auth_status}){quality_note}")
                 
             elif status_changed and server_name in ["Kezan", "Gurubashi"]:
+                # Additional context for non-notified status changes
                 if not self.is_auth_server_online():
                     self.add_to_log(f"⚠️ {server_name} status changed but Auth offline - no alert")
                 elif status_text == "REJECTING":
@@ -1742,6 +1952,7 @@ class ServerMonitor(QMainWindow):
                 elif not self.sound_notifications_enabled:
                     self.add_to_log(f"🔇 {server_name} status changed but notifications disabled")
             
+            # Auto-actions only trigger when servers come UP (not down)
             if status_changed and is_up and server_name in ["Kezan", "Gurubashi"] and status_text != "REJECTING":
                 if self.server_cards[server_name].enabled_cb.isChecked():
                     if self.auto_action_mode == "launch_and_focus":
@@ -1755,11 +1966,11 @@ class ServerMonitor(QMainWindow):
         # Could add global runtime stats here if needed
         pass
     
+
     def browse_executable(self):
-        """Open file dialog to select client executable"""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Select Client Executable",
+            "Select Client Executable", 
             "",
             "Executable files (*.exe);;All files (*.*)"
         )
@@ -1772,26 +1983,95 @@ class ServerMonitor(QMainWindow):
             self.update_client_button_states()
             self.add_to_log(f"Client executable set: {filename}")
             self.user_settings.set("client_executable_path", file_path)
+            
+            # Only try to auto-detect if no client directory is set OR if current directory was auto-detected
+            if "Game Client" in self.server_cards:
+                manifest_card = self.server_cards["Game Client"]
+                
+                # Check if user has manually set a client directory
+                if not manifest_card.client_directory or not manifest_card.client_directory_is_manual:
+                    # No manual directory set (or current was auto-detected) - try auto-detection from executable path
+                    auto_detected = manifest_card.set_client_directory(file_path)
+                    if auto_detected:
+                        self.add_to_log(f"🔍 Auto-detected client directory from executable path")
+                    else:
+                        self.add_to_log(f"💡 Could not auto-detect client directory - use '📁 Set Client Dir' button if needed")
+                else:
+                    # User has manually set directory - don't override it!
+                    manual_dir = os.path.basename(manifest_card.client_directory)
+                    self.add_to_log(f"📁 Keeping manually set client directory: {manual_dir}")
+                    self.add_to_log(f"💡 Note: Launch executable and game directory can be separate")
     
     def launch_client(self):
         if not self.client_executable_path:
-            self.add_to_log("No client executable selected!")
+            self.add_to_log("❌ No client executable selected!")
             return False
         
         if not os.path.exists(self.client_executable_path):
-            self.add_to_log("Selected executable not found!")
+            self.add_to_log("❌ Selected executable not found!")
             return False
         
+        filename = os.path.basename(self.client_executable_path)
+        
+        # Check client update status before launching
+        self.check_client_update_status_before_launch()
+        
+        # Check if client is already running
         try:
-            subprocess.Popen([self.client_executable_path])
-            filename = os.path.basename(self.client_executable_path)
-            self.add_to_log(f"Launched: {filename}")
+            if self.is_client_already_running():
+                self.add_to_log(f"⚠️ {filename} is already running - focusing existing window instead")
+                
+                # Try to bring existing window to front
+                success = self.bring_client_to_front()
+                if success:
+                    self.add_to_log(f"✅ Focused existing {filename} window")
+                else:
+                    self.add_to_log(f"❓ Could not focus existing window - it may be minimized")
+                
+                return True  # Consider this a success since client is running
+        except Exception as e:
+            # If process checking fails, just proceed with launch
+            self.add_to_log(f"🔍 Could not check for existing processes - launching anyway")
+        
+        # Client not running (or check failed) - launch new instance
+        try:
+            # Create process without showing console window
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+            
+            subprocess.Popen(
+                [self.client_executable_path],
+                startupinfo=startupinfo
+            )
+            self.add_to_log(f"🚀 Launched: {filename}")
             return True
         except Exception as e:
-            self.add_to_log(f"Error launching client: {e}")
+            self.add_to_log(f"❌ Error launching client: {e}")
             return False
-    
+
     def test_launch_client(self):
+        if not self.client_executable_path:
+            self.add_to_log("💡 Select a client executable first using the 'Browse' button")
+            return
+        
+        filename = os.path.basename(self.client_executable_path)
+        
+        # Check update status first
+        self.check_client_update_status_before_launch()
+        
+        # Show current status
+        try:
+            if self.is_client_already_running():
+                self.add_to_log(f"🔍 {filename} is currently running")
+            else:
+                self.add_to_log(f"🔍 {filename} is not currently running")
+        except Exception as e:
+            self.add_to_log(f"🔍 Could not detect process status - will attempt launch anyway")
+        
+        # Proceed with launch
         self.launch_client()
     
     def update_client_button_states(self):
@@ -1806,6 +2086,9 @@ class ServerMonitor(QMainWindow):
                 self.launch_and_focus_cb.setStyleSheet("color: #ffffff;")
     
     def bring_client_to_front(self):
+        # Check update status when focusing existing client
+        self.check_client_update_status_before_launch()
+        
         try:
             user32 = ctypes.windll.user32
             found_window = False
@@ -1819,15 +2102,17 @@ class ServerMonitor(QMainWindow):
                         user32.GetWindowTextW(hwnd, buffer, length + 1)
                         window_title = buffer.value
                         
-                        # Exclude Discord and other apps with strict filtering
-                        excluded_keywords = ["Monitor", "Chrome", "Firefox", "Edge", "Browser", "Discord", 
-                                           "Visual Studio", "Notepad", "Calculator", "Task Manager",
-                                           "File Explorer", "Windows Security", "Settings"]
+                        # Exclude common non-game applications
+                        excluded_keywords = [
+                            "Monitor", "Chrome", "Firefox", "Edge", "Browser", "Discord", 
+                            "Visual Studio", "Notepad", "Calculator", "Task Manager",
+                            "File Explorer", "Windows Security", "Settings", "Steam"
+                        ]
                         
                         if any(keyword.lower() in window_title.lower() for keyword in excluded_keywords):
                             return True
                         
-                        # Look for game windows with priority order
+                        # Priority search terms
                         target_keywords = []
                         
                         # Add executable name if selected (highest priority)
@@ -1838,6 +2123,7 @@ class ServerMonitor(QMainWindow):
                         # Add Project Epoch specific keywords
                         target_keywords.extend([
                             "Project Epoch",
+                            "Project-Epoch", 
                             "World of Warcraft", 
                             "WoW"
                         ])
@@ -1846,23 +2132,23 @@ class ServerMonitor(QMainWindow):
                         for keyword in target_keywords:
                             if keyword.lower() in window_title.lower():
                                 # Additional validation for Project Epoch to avoid Discord/browser tabs
-                                if "project epoch" in window_title.lower():
+                                if "project" in window_title.lower() and "epoch" in window_title.lower():
                                     excluded_in_title = ["discord", "chrome", "firefox", "edge", "browser", "tab"]
                                     if any(excluded.lower() in window_title.lower() for excluded in excluded_in_title):
-                                        continue  # Skip this window, it's a browser/discord tab
+                                        continue  # Skip this window
                                 
                                 try:
-                                    # Bring window to front with multiple methods for reliability
+                                    # Multi-method window focusing for better reliability
                                     user32.SetForegroundWindow(hwnd)
                                     user32.ShowWindow(hwnd, 9)  # SW_RESTORE
                                     user32.SetActiveWindow(hwnd)
                                     user32.BringWindowToTop(hwnd)
                                     
                                     found_window = True
-                                    self.add_to_log(f"Focused window: {window_title}")
+                                    self.add_to_log(f"✅ Focused window: {window_title}")
                                     return False  # Stop enumeration
                                 except Exception as e:
-                                    self.add_to_log(f"Failed to focus '{window_title}': {e}")
+                                    self.add_to_log(f"❌ Failed to focus '{window_title}': {e}")
                                     continue
                 
                 return True  # Continue enumeration
@@ -1872,19 +2158,161 @@ class ServerMonitor(QMainWindow):
             user32.EnumWindows(WNDENUMPROC(enum_windows_proc), 0)
             
             if not found_window:
-                self.add_to_log("No Project Epoch/WoW windows found to focus")
+                self.add_to_log("❓ No Project Epoch/WoW windows found to focus")
             
             return found_window
             
         except Exception as e:
-            self.add_to_log(f"Error bringing client to front: {e}")
+            self.add_to_log(f"❌ Error bringing client to front: {e}")
             return False
     
     def test_focus_client(self):
-        self.add_to_log("Testing window focus...")
+        self.add_to_log("🔍 Testing window focus...")
+        
+        # Check update status when testing focus
+        self.check_client_update_status_before_launch()
+        
+        # First check if client is running
+        if self.client_executable_path:
+            filename = os.path.basename(self.client_executable_path)
+            try:
+                if self.is_client_already_running():
+                    self.add_to_log(f"✅ {filename} is running - attempting to focus...")
+                else:
+                    self.add_to_log(f"⚠️ {filename} doesn't appear to be running")
+            except Exception:
+                self.add_to_log(f"🔍 Could not detect if {filename} is running")
+        
         success = self.bring_client_to_front()
         if not success:
-            self.add_to_log("Tip: Make sure Project Epoch is running first!")
+            self.add_to_log("💡 Tip: Make sure Project Epoch is running first!")
+
+    def check_client_update_status_before_launch(self):
+        """Check if client needs updating before launch/focus operations"""
+        try:
+            # Only check if we have the Game Client manifest card and it's monitoring
+            if "Game Client" not in self.server_cards:
+                return
+            
+            manifest_card = self.server_cards["Game Client"]
+            
+            # Only check if we have a client directory set and recent manifest data
+            if not manifest_card.client_directory or not manifest_card.last_manifest_data:
+                return
+            
+            # Only check if manifest monitoring is enabled
+            if not manifest_card.enabled_cb.isChecked():
+                return
+            
+            # Check if we have recent comparison data
+            if not manifest_card.last_comparison:
+                return
+            
+            comparison = manifest_card.last_comparison
+            status = comparison.get("status", "unknown")
+            version = comparison.get("version", "unknown")
+            
+            # Only log if client is not up-to-date
+            if status == "outdated":
+                files_outdated = comparison.get("files_outdated", 0)
+                self.add_to_log(f"🆙 Client update available to {version} ({files_outdated} files need updating)")
+                
+                # Play system sound for update notification (no custom sound for this)
+                if self.sound_notifications_enabled:
+                    threading.Thread(target=self.play_system_sound_only, daemon=True).start()
+                    
+            elif status == "incomplete":
+                files_missing = comparison.get("files_missing", 0)
+                self.add_to_log(f"❌ Client is missing {files_missing} critical files for {version}")
+                
+                # Play system sound for missing files warning
+                if self.sound_notifications_enabled:
+                    threading.Thread(target=self.play_system_sound_only, daemon=True).start()
+            
+            elif status == "up_to_date":
+                # Only log this occasionally to avoid spam, or if explicitly requested via test launch
+                if hasattr(self, '_last_update_check_log'):
+                    import time
+                    if time.time() - self._last_update_check_log < 60:  # Don't spam within 60 seconds
+                        return
+                
+                self._last_update_check_log = time.time()
+                self.add_to_log(f"✅ Client is up-to-date with {version}")
+            
+            # For unknown status, don't log anything to avoid confusion
+            
+        except Exception as e:
+            # Silently fail - update checking shouldn't break launch functionality
+            pass
+
+    def _check_unix_processes(self, exe_name):
+        """Unix/Linux process checking using ps command"""
+        try:
+            result = subprocess.run(
+                ['ps', '-A', '-o', 'comm='],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if result.returncode == 0:
+                process_names = result.stdout.lower().split('\n')
+                exe_base = exe_name.replace('.exe', '').lower()
+                
+                return any(exe_base in proc_name for proc_name in process_names)
+            else:
+                return False
+            
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+            return False
+        
+    def _check_windows_processes(self, exe_name):
+        """Windows-specific process checking using built-in tasklist command"""
+        try:
+            # Use tasklist with filter - this is built into Windows!
+            result = subprocess.run(
+                ['tasklist', '/FI', f'IMAGENAME eq {exe_name}'],
+                capture_output=True,
+                text=True,
+                shell=False,  # Don't use shell for better security
+                timeout=5,    # Increased timeout for slower systems
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0  # Hide console window
+            )
+            
+            if result.returncode == 0:
+                output = result.stdout.lower()
+                # tasklist returns the process if found, otherwise shows "no tasks running"
+                return exe_name.lower() in output and "no tasks are running" not in output
+            else:
+                return False
+            
+        except subprocess.TimeoutExpired:
+            self.add_to_log("⚠️ Process check timed out")
+            return False
+        except FileNotFoundError:
+            self.add_to_log("⚠️ tasklist command not found")
+            return False
+        except Exception as e:
+            return False
+        
+    def is_client_already_running(self):
+        try:
+            if not self.client_executable_path:
+                return False
+            
+            exe_name = os.path.basename(self.client_executable_path).lower()
+            
+            # Use built-in Windows commands (works in standalone exe too!)
+            if sys.platform == "win32":
+                return self._check_windows_processes(exe_name)
+            else:
+                # For non-Windows systems, use ps command
+                return self._check_unix_processes(exe_name)
+            
+        except Exception as e:
+            # If checking fails, assume not running to avoid blocking launch
+            self.add_to_log(f"🔍 Process detection failed, proceeding with launch")
+            return False
     
     def update_auto_action_checkboxes(self):
         self.no_action_cb.setChecked(self.auto_action_mode == "none")
@@ -1982,7 +2410,7 @@ class ServerMonitor(QMainWindow):
             self.play_system_sound()
     
     def play_sound(self):
-        """Play notification sound with volume control (updated logic)"""
+        """Play notification sound with volume control"""
         if not self.sound_notifications_enabled:
             return
             
@@ -2021,6 +2449,289 @@ class ServerMonitor(QMainWindow):
         # Scroll to bottom
         scrollbar = self.log_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+
+    def start_manifest_monitoring(self):
+            """Start manifest monitoring thread"""
+            try:
+                if self.manifest_thread:
+                    old_thread = self.manifest_thread
+                    if old_thread.running:
+                        old_thread.stop()
+                        self.threads_to_cleanup.append(old_thread)
+                        QApplication.processEvents()
+                
+                # Create new manifest thread
+                self.manifest_thread = ManifestMonitorThread()
+                self.manifest_thread.set_interval(self.manifest_check_interval)
+                self.manifest_thread.set_user_settings(self.user_settings)
+                
+                # Connect signals
+                self.manifest_thread.status_update.connect(self.on_manifest_status_update)
+                self.manifest_thread.version_changed.connect(self.on_build_version_changed)
+                
+                self.manifest_thread.running = True
+                self.manifest_thread.start()
+                
+                return True
+                
+            except Exception as e:
+                self.add_to_log(f"Error starting manifest monitoring: {e}")
+                return False
+
+    def stop_manifest_monitoring(self):
+        """Non-blocking manifest thread stopping"""
+        if self.manifest_thread and self.manifest_thread.running:
+            self.manifest_thread.stop()
+            self.threads_to_cleanup.append(self.manifest_thread)
+            self.manifest_thread = None
+            return True
+        return False
+
+    def on_manifest_status_update(self, server_name, is_up, check_duration, manifest_data):
+        if "Game Client" in self.server_cards:
+            card = self.server_cards["Game Client"]
+            
+            # Store old state to detect changes
+            old_is_up = card.is_up
+            old_version = getattr(card, 'current_version', None)
+            old_comparison_status = None
+            
+            if hasattr(card, 'last_comparison') and card.last_comparison:
+                old_comparison_status = f"{card.last_comparison['status']}_{card.last_comparison.get('version', 'unknown')}"
+            
+            card.update_manifest_status(is_up, check_duration, manifest_data)
+            
+            # Determine what changed and if we should log
+            current_time = datetime.now().strftime("%H:%M:%S")
+            should_log = False
+            log_entry = ""
+            
+            # Get last logged status for this server
+            last_logged_status = self.last_status_log.get(server_name, "")
+            
+            if is_up and manifest_data and 'Version' in manifest_data:
+                version = manifest_data['Version']
+                file_count = len(manifest_data.get('Files', []))
+                
+                # Check if version changed
+                version_changed = old_version != version
+                
+                if card.client_directory and card.last_comparison:
+                    # We have client directory - check comparison results
+                    comparison = card.last_comparison
+                    status = comparison["status"]
+                    current_comparison_status = f"{status}_{version}"
+                    
+                    # Only log if comparison status actually changed OR version changed
+                    if (last_logged_status != current_comparison_status) or version_changed:
+                        should_log = True
+                        
+                        if status == "up_to_date":
+                            if version_changed:
+                                log_entry = f"[{current_time}] Game Client: ✅ Updated to {version} and verified"
+                            else:
+                                log_entry = f"[{current_time}] Game Client: ✅ Up to date with {version}"
+                        elif status == "outdated":
+                            log_entry = f"[{current_time}] Game Client: 🆙 Update available to {version} ({comparison['files_outdated']} files need updating)"
+                        elif status == "incomplete":
+                            log_entry = f"[{current_time}] Game Client: ❌ Missing {comparison['files_missing']} critical files for {version}"
+                        else:
+                            log_entry = f"[{current_time}] Game Client: ❓ Cannot determine status for {version}"
+                        
+                        # Update tracking
+                        self.last_status_log[server_name] = current_comparison_status
+                        
+                else:
+                    # No client set - only log if we haven't logged this version yet
+                    current_status = f"manifest_only_{version}"
+                    if last_logged_status != current_status:
+                        should_log = True
+                        log_entry = f"[{current_time}] Manifest API: {version} available ({file_count} files) - Set client directory for comparison"
+                        self.last_status_log[server_name] = current_status
+                        
+            elif is_up and manifest_data and 'error' in manifest_data:
+                # Error case - only log if error type changed
+                error = manifest_data['error']
+                error_type = "timeout" if "timeout" in error.lower() else "connection" if "connection" in error.lower() or "ssl" in error.lower() else "format" if "json" in error.lower() else "other"
+                
+                current_error_status = f"error_{error_type}"
+                if last_logged_status != current_error_status:
+                    should_log = True
+                    log_entry = f"[{current_time}] Manifest API: ❌ {error}"
+                    self.last_status_log[server_name] = current_error_status
+                    
+            elif not is_up:
+                # Offline case - only log once per offline period
+                offline_status = "timeout" if check_duration > 8 else "offline"
+                current_offline_status = f"offline_{offline_status}"
+                
+                if last_logged_status != current_offline_status:
+                    should_log = True
+                    status_text = "⏱️ Connection timeout" if check_duration > 8 else "❌ Connection failed"
+                    log_entry = f"[{current_time}] Manifest API: {status_text}"
+                    self.last_status_log[server_name] = current_offline_status
+            
+            # Only log if something meaningful changed
+            if should_log and log_entry:
+                self.add_to_log(log_entry)
+
+    def on_build_version_changed(self, old_version, new_version):
+        # This is always worth logging since it's a significant event
+        self.add_to_log(f"Game Update Detected: {old_version} → {new_version}")
+        
+        # Check if client needs updating after version change
+        if "Game Client" in self.server_cards:
+            manifest_card = self.server_cards["Game Client"]
+            if manifest_card.client_directory and manifest_card.last_manifest_data:
+                # Re-run comparison with new manifest data
+                comparison = manifest_card.local_detector.compare_with_manifest(
+                    manifest_card.client_directory, 
+                    manifest_card.last_manifest_data
+                )
+                
+                if comparison["status"] == "outdated":
+                    self.add_to_log(f"🔄 Your client needs updating to {new_version}")
+                elif comparison["status"] == "up_to_date":
+                    self.add_to_log(f"✅ Your client is already updated to {new_version}")
+            else:
+                self.add_to_log(f"💡 Set client directory to check if update is needed")
+        
+        # Play Windows default sound for manifest updates
+        if self.sound_notifications_enabled:
+            threading.Thread(target=self.play_system_sound_only, daemon=True).start()
+            self.add_to_log(f"🔔 Update notification played")
+        
+        # Clear the tracking for Game Client since version changed
+        if "Game Client" in self.last_status_log:
+            del self.last_status_log["Game Client"]
+        
+        # Version history tracking (minimal logging)
+        version_info = self.user_settings.get_version_change_info()
+        history_count = len(version_info.get('history', []))
+        if history_count > 1:  # Only show count if we have multiple tracked versions
+            self.add_to_log(f"📈 Version change #{history_count} tracked")
+
+    def on_server_monitoring_toggled(self, server_name, enabled):
+        # Handle manifest monitoring specially
+        if server_name == "Game Client":
+            if enabled:
+                self.server_cards[server_name].set_to_starting_state()
+                if self.start_manifest_monitoring():
+                    self.add_to_log(f"Starting manifest monitoring...")
+                else:
+                    self.add_to_log(f"Failed to start manifest monitoring")
+                    self.server_cards[server_name].set_to_enabled_state()
+            else:
+                self.server_cards[server_name].set_to_disabled_state()
+                self.stop_manifest_monitoring()
+                self.add_to_log(f"Stopping manifest monitoring...")
+            return
+        
+        if not self.monitor_threads:
+            return
+        
+        if enabled:
+            self.server_cards[server_name].set_to_starting_state()
+            
+            if server_name not in self.monitor_threads or not self.monitor_threads[server_name].running:
+                if self.start_single_server_monitoring(server_name):
+                    self.add_to_log(f"Starting monitoring for {server_name}...")
+                else:
+                    self.add_to_log(f"Failed to start monitoring for {server_name}")
+                    self.server_cards[server_name].set_to_enabled_state()
+            else:
+                self.add_to_log(f"{server_name} is already being monitored")
+                self.server_cards[server_name].set_to_enabled_state()
+        else:
+            self.server_cards[server_name].set_to_disabled_state()
+            
+            if server_name in self.monitor_threads and self.monitor_threads[server_name].running:
+                self.stop_single_server_monitoring(server_name)
+                self.add_to_log(f"Stopping monitoring for {server_name}...")
+
+    def start_all_monitoring(self):
+        if self.start_time is None:
+            self.start_time = datetime.now()
+        
+        self.detect_active_server_connections()
+        
+        enabled_servers = []
+        
+        for server_name, card in self.server_cards.items():
+            if server_name == "Game Client":
+                continue
+                
+            if card.enabled_cb.isChecked():
+                card.set_to_starting_state()
+                enabled_servers.append(server_name)
+                self.start_single_server_monitoring(server_name)
+        
+        if self.server_cards["Game Client"].enabled_cb.isChecked():
+            self.server_cards["Game Client"].set_to_starting_state()
+            if self.start_manifest_monitoring():
+                enabled_servers.append("Game Client")
+        
+        if enabled_servers:
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(True)
+            self.ui_timer.start(1000)
+            
+            servers_list = ", ".join(enabled_servers)
+            self.add_to_log(f"Started monitoring: {servers_list}")
+            
+            # Clear previous status tracking
+            self.last_status_log.clear()
+        else:
+            self.add_to_log("No servers enabled for monitoring!")
+
+    def stop_all_monitoring(self):
+        stopped_servers = []
+        
+        # Signal all threads to stop (non-blocking)
+        for server_name, thread in list(self.monitor_threads.items()):
+            if thread.running:
+                thread.stop()
+                stopped_servers.append(server_name)
+                self.threads_to_cleanup.append(thread)
+        
+        self.monitor_threads.clear()
+        
+        # Stop manifest thread (non-blocking)
+        if self.manifest_thread and self.manifest_thread.running:
+            self.manifest_thread.stop()
+            self.threads_to_cleanup.append(self.manifest_thread)
+            stopped_servers.append("Game Client")
+            self.manifest_thread = None
+        
+        # Reset all server cards
+        for card in self.server_cards.values():
+            card.is_monitoring_disabled = False
+            card.is_starting = False
+            card.status_text.setText("STOPPED")
+            card.status_text.setStyleSheet("font-weight: bold; font-size: 12px; color: #ffab40;")
+            card.status_indicator.setStyleSheet("color: #757575; font-size: 20px;")
+            card.setStyleSheet("""
+                QWidget {
+                    background-color: #404040;
+                    border: 2px solid #555555;
+                    border-radius: 8px;
+                    margin: 2px;
+                }
+            """)
+        
+        # Update UI state
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.ui_timer.stop()
+        
+        if stopped_servers:
+            servers_list = ", ".join(stopped_servers)
+            self.add_to_log(f"Stopped monitoring: {servers_list}")
+        else:
+            self.add_to_log("All monitoring stopped")
+        
+        # Clear status tracking
+        self.last_status_log.clear()
 
 class AdvancedSettingsDialog(QDialog):
     """Advanced settings management dialog"""
@@ -2266,6 +2977,656 @@ class AdvancedSettingsDialog(QDialog):
             self.refresh_status()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save settings:\n{e}")
+
+class ManifestMonitorThread(QThread):
+    status_update = pyqtSignal(str, bool, float, dict)  # server_name, is_up, check_duration, manifest_data
+    version_changed = pyqtSignal(str, str)  # old_version, new_version
+    
+    def __init__(self, manifest_url="https://updater.project-epoch.net/api/v2/manifest?environment=production", parent=None):
+        super().__init__(parent)
+        self.manifest_url = manifest_url
+        self.server_name = "Game Client"
+        self.running = False
+        self.check_interval = 30  # Default 30 seconds
+        self._stop_event = threading.Event()
+        self.last_known_version = None
+        self.user_settings = None  # Will be set by parent
+
+    def __del__(self):
+        try:
+            self.stop()
+            if hasattr(self, '_stop_event'):
+                self._stop_event.set()
+        except:
+            pass  # Ignore errors during cleanup
+        
+    def run(self):
+        while self.running and not self._stop_event.is_set():
+            start_time = time.time()
+            is_up, manifest_data = self.check_manifest()
+            check_duration = time.time() - start_time
+            
+            self.status_update.emit(self.server_name, is_up, check_duration, manifest_data)
+            
+            # Check for version changes
+            if is_up and manifest_data and 'Version' in manifest_data:
+                current_version = manifest_data['Version']
+                
+                if self.user_settings:
+                    old_version = self.user_settings.update_build_version(current_version)
+                    
+                    # Emit version change signal if version actually changed
+                    if old_version and old_version != current_version:
+                        self.version_changed.emit(old_version, current_version)
+                
+                self.last_known_version = current_version
+            
+            remaining_sleep = max(0, self.check_interval - check_duration)
+            
+            if remaining_sleep > 0:
+                self._stop_event.wait(remaining_sleep)
+    
+    def check_manifest(self):
+        """Check the manifest URL and return status + data"""
+        try:
+            # Add headers to mimic a real browser request
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Cache-Control': 'no-cache'
+            }
+            
+            response = requests.get(
+                self.manifest_url, 
+                timeout=8,  # Reduced from 10 to 8 seconds
+                headers=headers,
+                verify=True  # Enable SSL verification
+            )
+            
+            if response.status_code == 200:
+                try:
+                    manifest_data = response.json()
+                    
+                    required_fields = ['Version', 'Files', 'Uid']
+                    if all(field in manifest_data for field in required_fields):
+                        manifest_data['_debug'] = {
+                            'response_time': response.elapsed.total_seconds(),
+                            'status_code': response.status_code,
+                            'content_length': len(response.content)
+                        }
+                        return True, manifest_data
+                    else:
+                        missing_fields = [f for f in required_fields if f not in manifest_data]
+                        return False, {"error": f"Invalid manifest format - missing: {', '.join(missing_fields)}"}
+                        
+                except json.JSONDecodeError as e:
+                    return False, {"error": f"JSON decode error: {str(e)[:50]}"}
+            else:
+                return False, {"error": f"HTTP {response.status_code}: {response.reason}"}
+                
+        except requests.exceptions.Timeout:
+            return False, {"error": "Request timeout (8s limit exceeded)"}
+        except requests.exceptions.SSLError as e:
+            return False, {"error": f"SSL error: {str(e)[:50]}"}
+        except requests.exceptions.ConnectionError as e:
+            return False, {"error": f"Connection failed: {str(e)[:50]}"}
+        except requests.exceptions.RequestException as e:
+            return False, {"error": f"Request error: {str(e)[:50]}"}
+        except Exception as e:
+            return False, {"error": f"Unexpected error: {str(e)[:50]}"}
+    
+    def set_interval(self, interval):
+        self.check_interval = max(15, min(300, interval))  # Between 15s and 5min
+    
+    def set_user_settings(self, user_settings):
+        self.user_settings = user_settings
+    
+    def stop(self):
+        self.running = False
+        if hasattr(self, '_stop_event'):
+            self._stop_event.set()
+
+class ManifestServerCard(ServerCard):
+    """Special server card for manifest/version monitoring with local file comparison"""
+    
+    def __init__(self, parent=None):
+        # Initialize with manifest-specific parameters
+        super().__init__("Game Client", "Manifest", 443, parent)
+        self.current_version = None
+        self.last_manifest_data = {}
+        self.local_detector = LocalClientDetector()
+        self.client_directory = None
+        self.client_directory_is_manual = False
+        self.last_comparison = None
+        
+        # Update the checkbox text for manifest monitoring
+        self.enabled_cb.setText("Monitor game updates")
+        
+        # Update port label to show URL instead of port
+        self.port_label.setText("updater.project-epoch.net")
+        
+        # Add version display
+        self.version_label = QLabel("Version: Unknown")
+        self.version_label.setStyleSheet("font-size: 10px; color: #64b5f6; font-weight: bold;")
+        
+        # Add client status display
+        self.client_status_label = QLabel("Client: Not Set")
+        self.client_status_label.setStyleSheet("font-size: 9px; color: #999999;")
+        
+        # Add browse button for client directory
+        self.browse_client_btn = QPushButton("📁 Set Client Dir")
+        self.browse_client_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 8px;
+                padding: 2px 4px;
+                max-height: 18px;
+                background-color: #505050;
+                border: 1px solid #666666;
+            }
+            QPushButton:hover {
+                background-color: #606060;
+            }
+        """)
+        self.browse_client_btn.clicked.connect(self.browse_client_directory)
+        self.browse_client_btn.setToolTip("Browse for Project Epoch game folder")
+        
+        # Insert widgets before the checkbox
+        layout = self.layout()
+        layout.insertWidget(layout.count() - 1, self.version_label)
+        
+        # Create horizontal layout for client status and browse button
+        client_row = QHBoxLayout()
+        client_row.setContentsMargins(0, 0, 0, 0)
+        client_row.addWidget(self.client_status_label)
+        client_row.addWidget(self.browse_client_btn)
+        client_row.setStretch(0, 1)
+        
+        # Create widget to hold the horizontal layout
+        client_widget = QWidget()
+        client_widget.setLayout(client_row)
+        layout.insertWidget(layout.count() - 1, client_widget)
+    
+    def browse_client_directory(self):
+        """Browse for client directory with option to clear"""
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+        
+        # If directory is already set, ask if they want to browse or clear
+        if self.client_directory:
+            reply = QMessageBox.question(
+                self,
+                "Client Directory Options",
+                f"Current directory: {os.path.basename(self.client_directory)}\n\nWhat would you like to do?",
+                QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Reset | QMessageBox.StandardButton.Cancel
+            )
+            reply.button(QMessageBox.StandardButton.Open).setText("Browse New")
+            reply.button(QMessageBox.StandardButton.Reset).setText("Clear Directory")
+            
+            if reply == QMessageBox.StandardButton.Reset:
+                self.clear_client_directory()
+                return
+            elif reply == QMessageBox.StandardButton.Cancel:
+                return
+        
+        # Start from current directory if set, otherwise user's home
+        start_dir = self.client_directory if self.client_directory else os.path.expanduser('~')
+        
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select Project Epoch Game Folder", 
+            start_dir,
+            QFileDialog.Option.ShowDirsOnly
+        )
+        
+        if directory:
+            # Mark this as manual directory selection
+            self.set_client_directory_path(directory, is_manual=True)
+    
+    def set_client_directory_path(self, directory_path, is_manual=False):
+        """Set client directory directly from path and save to settings"""
+        if not directory_path or not os.path.exists(directory_path):
+            # Only clear if this directory doesn't exist
+            if self.client_directory == directory_path:
+                self.client_directory = None
+                self.client_directory_is_manual = False
+            
+            self.client_status_label.setText("Client: Invalid Path")
+            self.client_status_label.setStyleSheet("font-size: 9px; color: #f44336;")
+            
+            # Only clear from settings if this was a manual attempt OR if we're clearing the same path
+            # Don't clear manual settings when auto-detection fails!
+            if is_manual and hasattr(self.parent(), 'user_settings'):
+                self.parent().user_settings.set("manifest_client_directory", "")
+                if hasattr(self.parent(), 'add_to_log'):
+                    self.parent().add_to_log("⚠️ Invalid directory selected - cleared from settings")
+            elif not is_manual and directory_path == self.client_directory:
+                # Only clear if we're trying to set the same path that's currently set
+                if hasattr(self.parent(), 'user_settings'):
+                    self.parent().user_settings.set("manifest_client_directory", "")
+            
+            return False
+        
+        # Verify it looks like a Project Epoch directory
+        required_files = ["Project-Epoch.exe", "Data"]
+        missing_files = [f for f in required_files if not os.path.exists(os.path.join(directory_path, f))]
+        
+        if missing_files:
+            # Only clear if this directory doesn't meet requirements
+            if self.client_directory == directory_path:
+                self.client_directory = None
+                self.client_directory_is_manual = False
+            
+            missing_str = ", ".join(missing_files)
+            self.client_status_label.setText(f"Client: Missing {missing_str}")
+            self.client_status_label.setStyleSheet("font-size: 9px; color: #f44336;")
+            self.client_status_label.setToolTip(f"This folder is missing: {missing_str}")
+            
+            # Only clear from settings if this was a manual attempt OR if we're clearing the same path
+            if is_manual and hasattr(self.parent(), 'user_settings'):
+                self.parent().user_settings.set("manifest_client_directory", "")
+                if hasattr(self.parent(), 'add_to_log'):
+                    self.parent().add_to_log(f"⚠️ Selected directory is not a valid Project Epoch folder - missing {missing_str}")
+            elif not is_manual and directory_path == self.client_directory:
+                # Only clear if we're trying to set the same path that's currently set
+                if hasattr(self.parent(), 'user_settings'):
+                    self.parent().user_settings.set("manifest_client_directory", "")
+            
+            return False
+        
+        # Valid directory - set and save to settings
+        self.client_directory = directory_path
+        self.client_directory_is_manual = is_manual  # Track how this was set
+        dir_name = os.path.basename(directory_path)
+        self.client_status_label.setText(f"Client: {dir_name}")
+        self.client_status_label.setStyleSheet("font-size: 9px; color: #64b5f6; font-weight: bold;")
+        self.client_status_label.setToolTip(f"Monitoring: {directory_path}")
+        
+        # Save to user settings
+        if hasattr(self.parent(), 'user_settings'):
+            self.parent().user_settings.set("manifest_client_directory", directory_path)
+            # Log differently based on how it was set
+            if hasattr(self.parent(), 'add_to_log'):
+                if is_manual:
+                    self.parent().add_to_log(f"📁 Manually set client directory: {dir_name}")
+                else:
+                    self.parent().add_to_log(f"🔍 Auto-detected client directory: {dir_name}")
+        
+        # Trigger a re-check if we have manifest data
+        if self.last_manifest_data and 'Version' in self.last_manifest_data:
+            self.update_manifest_status(self.is_up, 0, self.last_manifest_data)
+        
+        return True
+    
+    def clear_client_directory(self):
+        """Clear the client directory and remove from settings"""
+        self.client_directory = None
+        self.client_directory_is_manual = False  # Reset manual flag
+        self.client_status_label.setText("Client: Not Set")
+        self.client_status_label.setStyleSheet("font-size: 9px; color: #999999;")
+        self.client_status_label.setToolTip("Click 'Set Client Dir' to compare with local files")
+        
+        # Clear from settings
+        if hasattr(self.parent(), 'user_settings'):
+            self.parent().user_settings.set("manifest_client_directory", "")
+            if hasattr(self.parent(), 'add_to_log'):
+                self.parent().add_to_log("📂 Client directory cleared")
+    
+    def set_client_directory(self, client_executable_path):
+        """Set the client directory from executable path (AUTO-DETECTION method)"""
+        detected_dir = self.local_detector.detect_client_directory(client_executable_path)
+        if detected_dir:
+            # Mark this as auto-detected (not manual)
+            return self.set_client_directory_path(detected_dir, is_manual=False)
+        else:
+            # Don't clear existing manual directory when auto-detection fails!
+            if not self.client_directory_is_manual:
+                self.client_directory = None
+                self.client_directory_is_manual = False
+                
+                if client_executable_path:
+                    exe_name = os.path.basename(client_executable_path)
+                    self.client_status_label.setText(f"Client: {exe_name} (wrong folder?)")
+                    self.client_status_label.setStyleSheet("font-size: 9px; color: #ff9800;")
+                    self.client_status_label.setToolTip("Executable found but not in a valid Project Epoch folder")
+                else:
+                    self.client_status_label.setText("Client: Not Set")
+                    self.client_status_label.setStyleSheet("font-size: 9px; color: #999999;")
+            # If manual directory exists, keep it and don't change the UI
+            return False
+    
+    def update_manifest_status(self, is_up, check_duration, manifest_data):
+        """status logic - don't show misleading 'ONLINE' when no client is set"""
+        if self.is_monitoring_disabled:
+            return
+        
+        # Clear starting state when we get first real update
+        if self.is_starting:
+            self.is_starting = False
+        
+        self.is_up = is_up
+        self.total_checks += 1
+        if is_up:
+            self.successful_checks += 1
+        
+        self.last_check_time = datetime.now()
+        self.last_manifest_data = manifest_data
+        
+        # Update status display
+        if is_up and manifest_data and 'Version' in manifest_data:
+            # Update version display
+            self.current_version = manifest_data['Version']
+            self.version_label.setText(f"Version: {self.current_version}")
+            
+            # Different logic based on whether client is set
+            if self.client_directory:
+                # We have a client directory - do file comparison
+                comparison = self.local_detector.compare_with_manifest(self.client_directory, manifest_data)
+                self.last_comparison = comparison
+                
+                status_text, color, tooltip = self.local_detector.get_status_summary(comparison)
+                
+                # Update client status with comparison result
+                client_status_emoji = status_text.split()[0]
+                client_status_text = " ".join(status_text.split()[1:])
+                
+                dir_name = os.path.basename(self.client_directory)
+                self.client_status_label.setText(f"{client_status_emoji} {dir_name}")
+                self.client_status_label.setStyleSheet(f"font-size: 9px; color: {color}; font-weight: bold;")
+                self.client_status_label.setToolTip(f"{tooltip}\nPath: {self.client_directory}")
+                
+                # Set main status based on comparison
+                if comparison["status"] == "up_to_date":
+                    status_text = "UP TO DATE"
+                    main_color = "#66bb6a"
+                elif comparison["status"] == "outdated":
+                    status_text = "UPDATE NEEDED"
+                    main_color = "#ff9800"
+                elif comparison["status"] == "incomplete":
+                    status_text = "INCOMPLETE"
+                    main_color = "#f44336"
+                else:
+                    status_text = "COMPARISON ERR"
+                    main_color = "#ff9800"
+                    
+            else:
+                # No client directory set - show manifest status only
+                status_text = "MANIFEST ONLY"
+                main_color = "#64b5f6"
+                
+                self.client_status_label.setText("Client: Not Set")
+                self.client_status_label.setStyleSheet("font-size: 9px; color: #999999;")
+                self.client_status_label.setToolTip("Click 'Set Client Dir' to compare with local files")
+            
+            color = main_color
+            
+        elif is_up and manifest_data and 'error' in manifest_data:
+            error_msg = manifest_data['error']
+            
+            # Different colors for different error types
+            if "timeout" in error_msg.lower():
+                status_text = "TIMEOUT"
+                color = "#ff9800"
+            elif "ssl" in error_msg.lower() or "connection" in error_msg.lower():
+                status_text = "CONN ERROR"
+                color = "#f44336"
+            elif "json" in error_msg.lower() or "format" in error_msg.lower():
+                status_text = "FORMAT ERR"
+                color = "#ff9800"
+            else:
+                status_text = "ERROR"
+                color = "#f44336"
+            
+            # Show shortened error
+            short_error = error_msg[:25] + "..." if len(error_msg) > 25 else error_msg
+            self.version_label.setText(f"Error: {short_error}")
+            self.client_status_label.setText("Check Failed")
+            self.client_status_label.setStyleSheet("font-size: 9px; color: #f44336;")
+            
+        else:
+            # Complete failure case
+            if check_duration > 6:
+                status_text = "TIMEOUT"
+                color = "#ff9800"
+            else:
+                status_text = "OFFLINE"
+                color = "#f44336"
+                
+            self.version_label.setText("Version: Connection Failed")
+            self.client_status_label.setText("Manifest Offline")
+            self.client_status_label.setStyleSheet("font-size: 9px; color: #f44336;")
+        
+        self.status_text.setText(status_text)
+        self.status_text.setStyleSheet(f"font-weight: bold; font-size: 12px; color: {color};")
+        self.status_indicator.setStyleSheet(f"color: {color}; font-size: 20px;")
+        
+        border_color = color
+        self.setStyleSheet(f"""
+            QWidget {{
+                background-color: #404040;
+                border: 2px solid {border_color};
+                border-radius: 8px;
+                margin: 2px;
+            }}
+        """)
+        
+        # Update uptime
+        if self.total_checks > 0:
+            uptime_percent = (self.successful_checks / self.total_checks) * 100
+            self.uptime_label.setText(f"Uptime: {uptime_percent:.1f}%")
+        
+        # Update last check time
+        time_str = self.last_check_time.strftime("%H:%M:%S")
+        self.last_check_label.setText(f"Last: {time_str}")
+    
+    def get_comparison_details(self):
+        """Get detailed comparison information for logging"""
+        if not self.last_comparison:
+            return "No comparison data available"
+            
+        details = []
+        for file_detail in self.last_comparison.get("details", []):
+            status_emoji = "✅" if file_detail["status"] == "match" else "❌" if file_detail["status"] == "mismatch" else "❓"
+            details.append(f"{status_emoji} {file_detail['file']}: {file_detail['message']}")
+        
+        return "\n".join(details)
+    
+    def set_to_disabled_state(self):
+        """Override to preserve version info when disabled"""
+        super().set_to_disabled_state()
+        if self.current_version:
+            self.version_label.setText(f"Version: {self.current_version}")
+        else:
+            self.version_label.setText("Version: Unknown")
+        self.client_status_label.setText("Monitoring Disabled")
+        self.client_status_label.setStyleSheet("font-size: 9px; color: #666666;")
+    
+    def reset_stats(self):
+        """Reset stats but preserve client directory and version info"""
+        # Store client directory before calling parent reset
+        saved_client_dir = self.client_directory
+        saved_version = self.current_version
+        
+        # Call parent reset for basic stats
+        super().reset_stats()
+        
+        # Restore preserved data
+        self.client_directory = saved_client_dir
+        self.current_version = saved_version
+        
+        # Update UI to reflect preserved state
+        if self.client_directory:
+            dir_name = os.path.basename(self.client_directory)
+            self.client_status_label.setText(f"Client: {dir_name}")
+            self.client_status_label.setStyleSheet("font-size: 9px; color: #64b5f6; font-weight: bold;")
+            self.client_status_label.setToolTip(f"Monitoring: {self.client_directory}")
+        else:
+            self.client_status_label.setText("Client: Not Set")
+            self.client_status_label.setStyleSheet("font-size: 9px; color: #999999;")
+            self.client_status_label.setToolTip("Click 'Set Client Dir' to compare with local files")
+        
+        if self.current_version:
+            self.version_label.setText(f"Version: {self.current_version}")
+        else:
+            self.version_label.setText("Version: Unknown")
+        
+        # Clear comparison data (this should reset)
+        self.last_manifest_data = {}
+        self.last_comparison = None
+
+class LocalClientDetector:
+    """Detects local Project Epoch client version by comparing files with manifest"""
+    
+    def __init__(self):
+        self.key_files = [
+            "Project-Epoch.exe",
+            "Data/patch-A.MPQ", 
+            "Data/patch-B.MPQ",
+            "Data/patch-Y.MPQ",
+            "Data/patch-Z.MPQ"
+        ]
+    
+    def detect_client_directory(self, executable_path):
+        """Detect client directory from executable path"""
+        if not executable_path or not os.path.exists(executable_path):
+            return None
+            
+        client_dir = os.path.dirname(executable_path)
+        
+        # Verify it looks like a Project Epoch directory
+        required_files = ["Project-Epoch.exe", "Data"]
+        if all(os.path.exists(os.path.join(client_dir, f)) for f in required_files):
+            return client_dir
+        return None
+    
+    def get_file_info(self, client_dir, relative_path):
+        """Get file size and MD5 hash for a file"""
+        try:
+            file_path = os.path.join(client_dir, relative_path.replace('/', os.sep))
+            if not os.path.exists(file_path):
+                return None
+                
+            # Get file size
+            file_size = os.path.getsize(file_path)
+            
+            # Calculate MD5 hash
+            hash_md5 = hashlib.md5()
+            with open(file_path, "rb") as f:
+                # Read in chunks to handle large files
+                for chunk in iter(lambda: f.read(8192), b""):
+                    hash_md5.update(chunk)
+            
+            return {
+                "path": relative_path,
+                "size": file_size,
+                "hash": hash_md5.hexdigest().lower(),
+                "exists": True
+            }
+        except Exception as e:
+            return {
+                "path": relative_path,
+                "size": 0,
+                "hash": "",
+                "exists": False,
+                "error": str(e)
+            }
+    
+    def compare_with_manifest(self, client_dir, manifest_data):
+        """Compare local files with manifest data"""
+        if not client_dir or not manifest_data or 'Files' not in manifest_data:
+            return {
+                "status": "error",
+                "message": "Invalid client directory or manifest data"
+            }
+        
+        # Create lookup of manifest files
+        manifest_files = {}
+        for file_info in manifest_data['Files']:
+            path = file_info['Path'].replace('\\', '/')
+            manifest_files[path] = {
+                "size": file_info['Size'],
+                "hash": file_info['Hash'].lower(),
+                "path": path
+            }
+        
+        comparison_results = {
+            "version": manifest_data.get('Version', 'Unknown'),
+            "files_checked": 0,
+            "files_matched": 0,
+            "files_missing": 0,
+            "files_outdated": 0,
+            "status": "unknown",
+            "details": []
+        }
+        
+        # Check key files that indicate client version
+        for file_path in self.key_files:
+            normalized_path = file_path.replace('/', '\\')  # Manifest uses backslashes
+            
+            if normalized_path in manifest_files:
+                comparison_results["files_checked"] += 1
+                
+                # Get local file info
+                local_info = self.get_file_info(client_dir, file_path)
+                manifest_info = manifest_files[normalized_path]
+                
+                if not local_info or not local_info["exists"]:
+                    comparison_results["files_missing"] += 1
+                    comparison_results["details"].append({
+                        "file": file_path,
+                        "status": "missing",
+                        "message": f"File not found locally"
+                    })
+                    continue
+                
+                # Compare size and hash
+                size_match = local_info["size"] == manifest_info["size"]
+                hash_match = local_info["hash"] == manifest_info["hash"]
+                
+                if size_match and hash_match:
+                    comparison_results["files_matched"] += 1
+                    comparison_results["details"].append({
+                        "file": file_path,
+                        "status": "match",
+                        "message": "File matches manifest exactly"
+                    })
+                else:
+                    comparison_results["files_outdated"] += 1
+                    comparison_results["details"].append({
+                        "file": file_path,
+                        "status": "mismatch",
+                        "message": f"Size: {local_info['size']} vs {manifest_info['size']}, Hash match: {hash_match}",
+                        "local_hash": local_info["hash"],
+                        "expected_hash": manifest_info["hash"]
+                    })
+        
+        # Determine overall status
+        if comparison_results["files_missing"] > 0:
+            comparison_results["status"] = "incomplete"
+            comparison_results["message"] = f"Missing {comparison_results['files_missing']} critical files"
+        elif comparison_results["files_outdated"] > 0:
+            comparison_results["status"] = "outdated" 
+            comparison_results["message"] = f"Update needed - {comparison_results['files_outdated']} files don't match"
+        elif comparison_results["files_matched"] == comparison_results["files_checked"]:
+            comparison_results["status"] = "up_to_date"
+            comparison_results["message"] = f"All {comparison_results['files_matched']} files match - client is up to date!"
+        else:
+            comparison_results["status"] = "unknown"
+            comparison_results["message"] = "Unable to determine client status"
+        
+        return comparison_results
+
+    def get_status_summary(self, comparison_result):
+        """Get a human-readable status summary"""
+        status = comparison_result.get("status", "unknown")
+        
+        if status == "up_to_date":
+            return "✅ Up to Date", "#66bb6a", f"Client matches {comparison_result.get('version', 'current')} perfectly"
+        elif status == "outdated":
+            return "🆙 Update Available", "#ff9800", f"New version {comparison_result.get('version', '')} available"
+        elif status == "incomplete":
+            return "❌ Missing Files", "#f44336", "Some game files are missing"
+        else:
+            return "❓ Unknown Status", "#757575", "Cannot determine client version"
 
 def main():
     app = QApplication(sys.argv)
